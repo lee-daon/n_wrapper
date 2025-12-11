@@ -9,16 +9,14 @@ const spinnerEl = document.getElementById('spinner');
 const saverModeInput = document.getElementById('saverMode');
 const modeLabel = document.getElementById('modeLabel');
 
-const MODE = {
-  NORMAL: 'normal',
-  SAVER: 'saver',
-};
-
 const state = {
   total: 0,
   done: 0,
   running: false,
 };
+
+const REQUEST_INTERVAL_MS = 3300;
+let lastRequestAt = 0;
 
 restoreSettings();
 runButton.addEventListener('click', onRun);
@@ -129,7 +127,9 @@ async function processSingleNormal(file, apiKey) {
 
   const paddedBase64 = await blobToDataUrl(paddedBlob);
   const trimmedBase64 = paddedBase64.split(',')[1];
-  const translatedBase64 = await requestGeminiImage(apiKey, trimmedBase64, { imageSize: '2K' });
+  const translatedBase64 = await requestWithThrottle(() =>
+    requestGeminiImage(apiKey, trimmedBase64, { imageSize: '2K' })
+  );
   const translatedBlob = await cropTranslated(translatedBase64, meta);
 
   return {
@@ -151,13 +151,19 @@ async function processSaverMode(files, apiKey, onProgress) {
   }
 
   const sheets = buildSheets(tiles);
+  const placedCount = sheets.reduce((sum, s) => sum + s.placements.length, 0);
+  if (placedCount !== tiles.length) {
+    throw new Error('배치 과정에서 일부 이미지가 누락되었습니다.');
+  }
   const results = [];
 
-  for (const sheet of sheets) {
+  const tasks = sheets.map(async (sheet) => {
     const sheetBlob = await canvasToBlob(sheet.canvas);
     const sheetBase64 = await blobToDataUrl(sheetBlob);
     const trimmedBase64 = sheetBase64.split(',')[1];
-    const translatedBase64 = await requestGeminiImage(apiKey, trimmedBase64, { imageSize: '2K' });
+    const translatedBase64 = await requestWithThrottle(() =>
+      requestGeminiImage(apiKey, trimmedBase64, { imageSize: '2K' })
+    );
     const translatedImg = await loadImage(`data:image/png;base64,${translatedBase64}`);
 
     for (const placement of sheet.placements) {
@@ -169,22 +175,20 @@ async function processSaverMode(files, apiKey, onProgress) {
       });
       onProgress?.();
     }
-  }
+  });
+
+  await Promise.all(tasks);
 
   return results;
 }
 
 function scaleForSaver(img) {
   const targetWidth = 1000;
-  const baseScale = targetWidth / (img.width || 1);
-  let width = Math.max(1, Math.round(img.width * baseScale));
-  let height = Math.max(1, Math.round(img.height * baseScale));
-
-  if (height > 2048) {
-    const fixScale = 2048 / height;
-    width = Math.max(1, Math.round(width * fixScale));
-    height = 2048;
-  }
+  const maxHeight = 2048;
+  const scale = Math.min(targetWidth / (img.width || 1), maxHeight / (img.height || 1));
+  let width = Math.max(1, Math.round(img.width * scale));
+  let height = Math.max(1, Math.round(img.height * scale));
+  height = Math.min(height, maxHeight);
 
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -216,38 +220,87 @@ function buildSheets(tiles) {
     }
   }
 
-  // 높이 내림차순 정렬: 키 큰 것부터 배치, 남는 자리는 작은 것들이 채움
+  // 높이 내림차순 정렬 후, 두 컬럼에 남는 세로 공간까지 채우는 선반 방식
   const sortedTiles = [...tiles].sort((a, b) => b.height - a.height);
 
   const sheets = [];
-  let idx = 0;
 
-  while (idx < sortedTiles.length) {
-    const rows = [];
-    let usedHeight = 0;
+  while (sortedTiles.length) {
+    const sheetPlacements = [];
+    const columns = [
+      { heightUsed: 0, count: 0 },
+      { heightUsed: 0, count: 0 },
+    ];
 
-    while (idx < sortedTiles.length) {
-      const rowTiles = sortedTiles.slice(idx, idx + cols);
-      const rowHeight = Math.max(...rowTiles.map((t) => t.height));
-      const needed = (rows.length ? rowGap : 0) + rowHeight;
-      if (rows.length && usedHeight + needed > maxHeight) break;
-      if (!rows.length && rowHeight > maxHeight) break;
+    let placedInThisSheet = true;
+    while (placedInThisSheet && sortedTiles.length) {
+      placedInThisSheet = false;
 
-      rows.push({ tiles: rowTiles, height: rowHeight });
-      usedHeight += needed;
-      idx += rowTiles.length;
+      for (let i = 0; i < sortedTiles.length; i += 1) {
+        const tile = sortedTiles[i];
+        const fits = [];
 
-      if (usedHeight >= maxHeight) break;
+        for (let colIndex = 0; colIndex < cols; colIndex += 1) {
+          const col = columns[colIndex];
+          const gap = col.count > 0 ? rowGap : 0;
+          const y = col.heightUsed + gap;
+          const remaining = maxHeight - y;
+          if (remaining >= tile.height) {
+            fits.push({
+              colIndex,
+              y,
+              gapStart: col.count > 0 ? col.heightUsed : null,
+              leftover: remaining - tile.height,
+            });
+          }
+        }
+
+        if (!fits.length) {
+          continue;
+        }
+
+        // 가장 딱 맞는(col leftover 최소) 컬럼에 배치
+        fits.sort((a, b) => a.leftover - b.leftover || a.colIndex - b.colIndex);
+        const chosen = fits[0];
+        const col = columns[chosen.colIndex];
+        const cellX = xPositions[chosen.colIndex];
+        const drawX = cellX + Math.floor((cellWidth - tile.width) / 2);
+        const drawY = chosen.y;
+
+        sheetPlacements.push({
+          tile,
+          x: drawX,
+          y: drawY,
+          width: tile.width,
+          height: tile.height,
+          colIndex: chosen.colIndex,
+          gapStart: chosen.gapStart,
+        });
+
+        col.heightUsed = drawY + tile.height;
+        col.count += 1;
+
+        sortedTiles.splice(i, 1);
+        placedInThisSheet = true;
+        break; // 타일 목록이 바뀌었으니 처음부터 다시 스캔
+      }
     }
 
+    if (!sheetPlacements.length) {
+      throw new Error('타일 배치에 실패했습니다.');
+    }
+
+    sheets.push({ placements: sheetPlacements });
+  }
+
+  // 실제 렌더링 및 경계선 처리
+  sheets.forEach((s) => {
     const canvas = document.createElement('canvas');
     canvas.width = maxWidth;
     canvas.height = maxHeight;
     const ctx = canvas.getContext('2d');
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, maxWidth, maxHeight);
-
-    const placements = [];
 
     // 세로 경계선
     for (let g = 0; g < gapWidths.length; g += 1) {
@@ -256,33 +309,19 @@ function buildSheets(tiles) {
       ctx.fillRect(startX, 0, gapWidths[g], maxHeight);
     }
 
-    let y = 0;
-    rows.forEach((row, rowIndex) => {
-      if (rowIndex > 0) {
-        ctx.fillStyle = '#000000';
-        ctx.fillRect(0, y, maxWidth, rowGap);
-        y += rowGap;
-      }
-
-      row.tiles.forEach((tile, colIndex) => {
-        const cellX = xPositions[colIndex];
-        const drawX = cellX + Math.floor((cellWidth - tile.width) / 2);
-        const drawY = y + Math.floor((row.height - tile.height) / 2);
-        ctx.drawImage(tile.canvas, drawX, drawY, tile.width, tile.height);
-        placements.push({
-          tile,
-          x: drawX,
-          y: drawY,
-          width: tile.width,
-          height: tile.height,
-        });
+    // 타일과 가로 경계선(열 내부) 렌더
+    s.placements
+      .sort((a, b) => a.y - b.y)
+      .forEach((p) => {
+        if (p.gapStart != null) {
+          ctx.fillStyle = '#000000';
+          ctx.fillRect(xPositions[p.colIndex], p.gapStart, cellWidth, rowGap);
+        }
+        ctx.drawImage(p.tile.canvas, p.x, p.y, p.width, p.height);
       });
 
-      y += row.height;
-    });
-
-    sheets.push({ canvas, placements });
-  }
+    s.canvas = canvas;
+  });
 
   return sheets;
 }
@@ -323,6 +362,17 @@ async function resizeAndPad(file, targetSize) {
   };
 }
 
+async function requestWithThrottle(apiCall) {
+  const now = Date.now();
+  const wait = Math.max(0, REQUEST_INTERVAL_MS - (now - lastRequestAt));
+  if (wait > 0) {
+    await sleep(wait);
+  }
+  const result = await apiCall();
+  lastRequestAt = Date.now();
+  return result;
+}
+
 async function cropTranslated(base64, meta) {
   const dataUrl = `data:image/png;base64,${base64}`;
   const img = await loadImage(dataUrl);
@@ -346,11 +396,26 @@ async function cropFromCollage(img, placement) {
   return await canvasToBlob(canvas);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function downloadZip(items) {
   const files = [];
+  const nameCount = new Map();
+
+  const withUniqueName = (base, suffix) => {
+    const key = `${base}${suffix || ''}`;
+    const count = nameCount.get(key) || 0;
+    nameCount.set(key, count + 1);
+    return count === 0 ? `${key}.png` : `${key}-${count}.png`;
+  };
+
   for (const item of items) {
-    files.push({ name: `${item.baseName}.png`, blob: item.paddedBlob });
-    files.push({ name: `${item.baseName}-(translate).png`, blob: item.translatedBlob });
+    const originalName = withUniqueName(item.baseName, '');
+    const translatedName = withUniqueName(item.baseName, '-(translate)');
+    files.push({ name: originalName, blob: item.paddedBlob });
+    files.push({ name: translatedName, blob: item.translatedBlob });
   }
 
   const zipBlob = await buildZip(files);
@@ -395,18 +460,19 @@ async function blobToDataUrl(blob) {
   });
 }
 
-function base64ToBlob(base64, type = 'application/octet-stream') {
-  const binary = atob(base64);
-  const len = binary.length;
-  const buffer = new Uint8Array(len);
-  for (let i = 0; i < len; i += 1) {
-    buffer[i] = binary.charCodeAt(i);
-  }
-  return new Blob([buffer], { type });
-}
-
 async function canvasToBlob(canvas) {
-  return await new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
+  return await new Promise((resolve, reject) =>
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          reject(new Error('이미지 직렬화에 실패했습니다.'));
+          return;
+        }
+        resolve(blob);
+      },
+      'image/png'
+    )
+  );
 }
 
 async function buildZip(files) {
@@ -425,7 +491,7 @@ async function buildZip(files) {
     const lhView = new DataView(localHeader.buffer);
     lhView.setUint32(0, 0x04034b50, true);
     lhView.setUint16(4, 20, true);
-    lhView.setUint16(6, 0, true);
+    lhView.setUint16(6, 0x0800, true); // UTF-8 flag
     lhView.setUint16(8, 0, true);
     lhView.setUint16(10, dosTime, true);
     lhView.setUint16(12, dosDate, true);
@@ -457,7 +523,7 @@ async function buildZip(files) {
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(4, 20, true);
     cv.setUint16(6, 20, true);
-    cv.setUint16(8, 0, true);
+    cv.setUint16(8, 0x0800, true); // UTF-8 flag
     cv.setUint16(10, 0, true);
     cv.setUint16(12, entry.dosTime, true);
     cv.setUint16(14, entry.dosDate, true);
