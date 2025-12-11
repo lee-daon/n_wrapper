@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini 이미지 번역기",
+  "version": "0.1.0",
+  "description": "폴더 내 이미지를 1024px 정사각형으로 리사이즈하고 Gemini로 번역한 결과를 ZIP으로 내려받습니다.",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Gemini 번역"
+  },
+  "permissions": ["storage"],
+  "host_permissions": ["https://generativelanguage.googleapis.com/*"]
+}
+
