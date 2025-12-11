@@ -2,12 +2,20 @@
   "manifest_version": 3,
   "name": "Gemini 이미지 번역기",
   "version": "0.1.0",
-  "description": "폴더 내 이미지를 1024px 정사각형으로 리사이즈하고 Gemini로 번역한 결과를 ZIP으로 내려받습니다.",
+  "description": "일반 모드는 이미지의 긴 변을 2048px로 잡고 번역된 이미지를 반환합니다. 효율 모드는 가로 1000px로 리사이즈 후 비용 효율 조합으로 번역 요청 후 결과를 반환합니다.",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Gemini 번역"
+    "default_title": "Gemini 번역",
+    "default_icon": {
+      "16": "3.png",
+      "32": "3.png"
+    }
   },
-  "permissions": ["storage"],
+  "icons": {
+    "16": "3.png",
+    "48": "3.png",
+    "128": "3.png"
+  },
   "host_permissions": ["https://generativelanguage.googleapis.com/*"]
 }
 

@@ -38,7 +38,7 @@ function restoreSettings() {
 
 function renderModeLabel() {
   if (!modeLabel) return;
-  modeLabel.textContent = saverModeInput.checked ? '절약 ON' : '일반';
+  modeLabel.textContent = saverModeInput.checked ? '효율' : '일반';
 }
 
 function setStatus(message) {
